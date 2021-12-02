@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
-import os
 from enum import Enum
 from typing import List, Optional, Union
 
-from botocore.errorfactory import ClientError
+import datetime
+
+import boto3
+from botocore.config import Config
 from networkx import Graph, complete_graph, from_edgelist
 
 from braket.annealing.problem import Problem
@@ -79,7 +81,7 @@ class AwsDevice(Device):
     def run(
         self,
         task_specification: Union[Circuit, Problem],
-        s3_destination_folder: Optional[AwsSession.S3DestinationFolder] = None,
+        s3_destination_folder: AwsSession.S3DestinationFolder,
         shots: Optional[int] = None,
         poll_timeout_seconds: float = AwsQuantumTask.DEFAULT_RESULTS_POLL_TIMEOUT,
         poll_interval_seconds: float = AwsQuantumTask.DEFAULT_RESULTS_POLL_INTERVAL,
@@ -93,10 +95,7 @@ class AwsDevice(Device):
         Args:
             task_specification (Union[Circuit, Problem]): Specification of task
                 (circuit or annealing problem) to run on device.
-            s3_destination_folder (AwsSession.S3DestinationFolder, optional): The S3 location to
-                save the task's results to. Default is `<default_bucket>/tasks` if evoked
-                outside of a Braket Job, `<Job Bucket>/jobs/<job name>/tasks` if evoked inside of
-                a Braket Job.
+            s3_destination_folder: The S3 location to save theotask's results to.
             shots (int, optional): The number of times to run the circuit or annealing problem.
                 Default is 1000 for QPUs and 0 for simulators.
             poll_timeout_seconds (float): The polling timeout for `AwsQuantumTask.result()`,
@@ -144,13 +143,7 @@ class AwsDevice(Device):
             self._aws_session,
             self._arn,
             task_specification,
-            s3_destination_folder
-            or (
-                AwsSession.parse_s3_uri(os.environ.get("AMZN_BRAKET_TASK_RESULTS_S3_URI"))
-                if "AMZN_BRAKET_TASK_RESULTS_S3_URI" in os.environ
-                else None
-            )
-            or (self._aws_session.default_bucket(), "tasks"),
+            s3_destination_folder,
             shots if shots is not None else self._default_shots,
             poll_timeout_seconds=poll_timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
@@ -161,7 +154,7 @@ class AwsDevice(Device):
     def run_batch(
         self,
         task_specifications: List[Union[Circuit, Problem]],
-        s3_destination_folder: Optional[AwsSession.S3DestinationFolder] = None,
+        s3_destination_folder: AwsSession.S3DestinationFolder,
         shots: Optional[int] = None,
         max_parallel: Optional[int] = None,
         max_connections: int = AwsQuantumTaskBatch.MAX_CONNECTIONS_DEFAULT,
@@ -175,10 +168,7 @@ class AwsDevice(Device):
         Args:
             task_specifications (List[Union[Circuit, Problem]]): List of  circuits
                 or annealing problems to run on device.
-            s3_destination_folder (AwsSession.S3DestinationFolder, optional): The S3 location to
-                save the tasks' results to. Default is `<default_bucket>/tasks` if evoked
-                outside of a Braket Job, `<Job Bucket>/jobs/<job name>/tasks` if evoked inside of
-                a Braket Job.
+            s3_destination_folder: The S3 location to save the tasks' results to.
             shots (int, optional): The number of times to run the circuit or annealing problem.
                 Default is 1000 for QPUs and 0 for simulators.
             max_parallel (int, optional): The maximum number of tasks to run on AWS in parallel.
@@ -202,16 +192,10 @@ class AwsDevice(Device):
             `braket.aws.aws_quantum_task_batch.AwsQuantumTaskBatch`
         """
         return AwsQuantumTaskBatch(
-            AwsSession.copy_session(self._aws_session, max_connections=max_connections),
+            AwsDevice._copy_aws_session(self._aws_session, max_connections=max_connections),
             self._arn,
             task_specifications,
-            s3_destination_folder
-            or (
-                AwsSession.parse_s3_uri(os.environ.get("AMZN_BRAKET_TASK_RESULTS_S3_URI"))
-                if "AMZN_BRAKET_TASK_RESULTS_S3_URI" in os.environ
-                else None
-            )
-            or (self._aws_session.default_bucket(), "tasks"),
+            s3_destination_folder,
             shots if shots is not None else self._default_shots,
             max_parallel=max_parallel if max_parallel is not None else self._default_max_parallel,
             max_workers=max_connections,
@@ -228,26 +212,22 @@ class AwsDevice(Device):
         self._populate_properties(self._aws_session)
 
     def _get_session_and_initialize(self, session):
-        current_region = session.region
+        current_region = session.boto_session.region_name
         try:
             self._populate_properties(session)
             return session
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "ResourceNotFoundException":
-                if "qpu" not in self._arn:
-                    raise ValueError(f"Simulator '{self._arn}' not found in '{current_region}'")
-            else:
-                raise e
+        except Exception:
+            if "qpu" not in self._arn:
+                raise ValueError(f"Simulator {self._arn} not found in {current_region}")
         # Search remaining regions for QPU
         for region in frozenset(AwsDevice.REGIONS) - {current_region}:
-            region_session = AwsSession.copy_session(session, region)
+            region_session = AwsDevice._copy_aws_session(session, region)
             try:
                 self._populate_properties(region_session)
                 return region_session
-            except ClientError as e:
-                if e.response["Error"]["Code"] != "ResourceNotFoundException":
-                    raise e
-        raise ValueError(f"QPU '{self._arn}' not found")
+            except Exception:
+                pass
+        raise ValueError(f"QPU {self._arn} not found")
 
     def _populate_properties(self, session):
         metadata = session.get_device(self._arn)
@@ -337,6 +317,27 @@ class AwsDevice(Device):
     def _default_max_parallel(self):
         return AwsDevice.DEFAULT_MAX_PARALLEL
 
+    @staticmethod
+    def _copy_aws_session(
+        aws_session: AwsSession,
+        region: Optional[str] = None,
+        max_connections: Optional[int] = None,
+    ) -> AwsSession:
+        config = Config(max_pool_connections=max_connections) if max_connections else None
+        session_region = aws_session.boto_session.region_name
+        new_region = region or session_region
+        creds = aws_session.boto_session.get_credentials()
+        if creds.method == "explicit":
+            boto_session = boto3.Session(
+                aws_access_key_id=creds.access_key,
+                aws_secret_access_key=creds.secret_key,
+                aws_session_token=creds.token,
+                region_name=new_region,
+            )
+        else:
+            boto_session = boto3.Session(region_name=new_region)
+        return AwsSession(boto_session=boto_session, config=config)
+
     def __repr__(self):
         return "Device('name': {}, 'arn': {})".format(self.name, self.arn)
 
@@ -398,7 +399,7 @@ class AwsDevice(Device):
             session_for_region = (
                 aws_session
                 if region == session_region
-                else AwsSession.copy_session(aws_session, region)
+                else AwsDevice._copy_aws_session(aws_session, region)
             )
             # Simulators are only instantiated in the same region as the AWS session
             types_for_region = sorted(
@@ -424,3 +425,117 @@ class AwsDevice(Device):
         devices = list(device_map.values())
         devices.sort(key=lambda x: getattr(x, order_by))
         return devices
+
+    @staticmethod
+    def _splitWindow(window):
+        start_hour = window.windowStartHour.hour
+        start_min = window.windowStartHour.minute
+        end_hour = window.windowEndHour.hour
+        end_min = window.windowEndHour.minute
+        
+        return start_hour, start_min, end_hour, end_min
+    
+    def _createTimeRange(date, window, available_days):
+        TWENTY_FOUR_HOURS_IN_MILLISECONDS = 86400000
+        # hour/min string -> numbers
+        start_hour, start_min, end_hour, end_min = AwsDevice._splitWindow(window)
+        
+        time_ranges = []
+        
+        for day in available_days:
+            # Set the start and end times to be on the same day as the current time, then shift them to there correct day using milliseconds offset
+            # Shifting after converting to milliseconds is much easier than dealing with calendar dates 
+            start_utc = datetime.datetime(date.year, date.month, date.day, start_hour, start_min, 0).timestamp()*1000
+            end_utc = datetime.datetime(date.year, date.month, date.day, end_hour, end_min, 0).timestamp()*1000
+            
+            start_utc = start_utc + TWENTY_FOUR_HOURS_IN_MILLISECONDS * (day - date.weekday())
+            end_utc = end_utc + TWENTY_FOUR_HOURS_IN_MILLISECONDS * (day - date.weekday())
+            
+            if start_utc > end_utc:
+                # If the time wraps to the next day and the day is Sunday(6) we need to wrap to Monday(0) so zero out the current weekday 
+                if (day == 6):
+                    wrap_start_utc = wrap_start_utc + TWENTY_FOUR_HOURS_IN_MILLISECONDS * (day - 7 - date.weekday())
+                    wrap_end_utc = wrap_end_utc + TWENTY_FOUR_HOURS_IN_MILLISECONDS * (day - 6 - date.weekday())
+                    
+                    time_ranges.insert(0, [wrap_start_utc, wrap_end_utc])
+                end_utc = end_utc + TWENTY_FOUR_HOURS_IN_MILLISECONDS
+            
+            time_ranges.append([start_utc, end_utc])
+        
+        return time_ranges
+    
+    def _getTimeDifference(date, window, available_days):
+        # We need to get the available windows in the current week and the week after incase the next available day is a week away.
+        # For example, if the current time 6 pm on Friday and the range is every Friday from 1pm-5pm, then the next range will be a next Friday at 1pm
+        nextweek_days = [] 
+        for day in available_days:
+            nextweek_days.append(day + 7)
+        available_days = available_days + nextweek_days
+
+        # Get current time in milliseconds
+        current_time = date.timestamp() * 1000
+        # Create an array of possible available ranges
+        time_ranges = AwsDevice._createTimeRange(date, window, available_days)
+        
+        for time_range in time_ranges:
+            # If the current time is in the range then return 0
+            if current_time > time_range[0] and current_time < time_range[1]:
+                return 0
+            # The ranges will be in chronological order the current time will always be either in a range or less than one
+            elif current_time < time_range[0]:
+                return time_range[0] - current_time
+
+    @staticmethod
+    def next_available_time(self) -> int:
+        """
+        Get the next available time in seconds. If the device is offline or retired, 
+        The return value is -1
+
+        Examples:
+            >>> next_time_in_seconds = AwsDevice.next_available_time()
+
+        Returns:
+            int : next available time in seconds
+        """
+        # refresh to get the recent meta data
+        self._populate_properties(self._aws_session)
+        DaysEnum = {
+            'Sunday': 6,
+            'Monday': 0,
+            'Tuesday': 1,
+            'Wednesday': 2,
+            'Thursday': 3,
+            'Friday': 4,
+            'Saturday': 5
+            }
+            
+        if self._status in ['OFFLINE', 'RETIRED']:
+            # the device is not online
+            return -1
+            
+        windows = self._properties.service.executionWindows
+        
+        # minimum time is 20 ms
+        min_time = None
+        calc_time = 0
+        
+        date = datetime.datetime.utcnow()
+
+        for window in windows:
+            exec_day = window.executionDay.value
+            # "Everyday" | "Weekdays" | "Weekend" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday" | "Sunday"
+            if exec_day == 'Everyday':
+                calc_time = AwsDevice._getTimeDifference(date, window, range(0,7))
+            elif exec_day == 'Weekdays':
+                calc_time = AwsDevice._getTimeDifference(date, window, range(0,6))
+            elif exec_day == 'Weekend':
+                calc_time = AwsDevice._getTimeDifference(date, window, [5,6])
+            else:
+                calc_time = AwsDevice._getTimeDifference(date, window, [DaysEnum[exec_day]])
+        
+        if (min_time == None or calc_time < min_time):
+            min_time = calc_time
+        if min_time == None:
+            return 0
+        else:
+            return min_time/1000.
